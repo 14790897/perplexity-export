@@ -353,9 +353,8 @@
             u.searchParams.set('source', apiSource);
 
             const bodies = [
-              { thread_id: threadId, type: 'markdown' },
-              { id: threadId, type: 'markdown' },
-              { threadId: threadId, type: 'markdown' }
+              // 首选：新接口要求的字段
+              { thread_uuid: threadId, format: "md" },
             ];
 
             for (let i = 0; i < bodies.length; i++) {
