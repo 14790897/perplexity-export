@@ -10,6 +10,7 @@ Perplexity 集合导出（Tampermonkey 用户脚本）
 - 在 `https://www.perplexity.ai/*` 右下角插入“导出 PPLX 集合”浮窗。
 - 粘贴集合接口 URL 或仅填写 `collection_slug`，自动分页抓取并下载 JSON。
 - 可选：勾选“同时获取每条对话的 Markdown”，脚本会调用 `POST /rest/thread/export?version=...&source=...` 逐条拉取 MD 并附加到每个条目的 `markdown` 字段。
+- 可选：勾选“导出为多个 .md 文件”（逐条保存 Markdown），或“合并为一个 .md”（把所有 Markdown 合成一个文件）。
 - 请求头无需手动设置（沿用网页会话）。
 
 3) 使用步骤
@@ -19,8 +20,9 @@ Perplexity 集合导出（Tampermonkey 用户脚本）
     示例（请把 YOUR_SLUG 替换成你的集合 slug）：
     `https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default`
   - 可选：勾选“同时获取每条对话的 Markdown”。
+  - 可选：勾选“导出为多个 .md 文件”或“合并为一个 .md”。
   - 点击“抓取并下载 JSON”。
-- 脚本会按 `limit/offset` 自动分页；若勾选了 MD，则逐条请求 `thread/export` 并附加 `markdown`。最终下载 `pplx_<slug>_threads_<count>[_with_md].json`。
+- 脚本会按 `limit/offset` 自动分页；若勾选了 MD，则逐条请求 `thread/export` 并附加 `markdown`。最终下载 `pplx_<slug>_threads_<count>[_with_md].json`；若勾选导出 .md，则另外下载多个或一个 `.md` 文件。
 
 4) 说明与扩展
 - 仅使用浏览器原生 `fetch`，不额外设置请求头。

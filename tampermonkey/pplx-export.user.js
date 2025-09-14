@@ -8,11 +8,9 @@
 // @grant        GM_addStyle
 // @grant        GM_download
 // @run-at       document-idle
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=perplexity.ai
+
 // ==/UserScript==
-/*
-  注意：本脚本文件使用 UTF-8 编码。
-  如果复制到本地编辑器，请以 UTF-8 保存，否则中文会乱码。
-*/
 
 (function () {
   'use strict';
@@ -108,6 +106,24 @@
     const base = (s || '').toString().normalize('NFC').replace(/[\r\n\t]/g, ' ').trim();
     const cleaned = base.replace(/[\/\\?%*:|"<>]/g, '_').replace(/\s+/g, ' ').slice(0, max).trim();
     return cleaned || 'untitled';
+  }
+
+  function base64ToUtf8(b64) {
+    try {
+      // atob -> binary string -> Uint8Array -> TextDecoder
+      const bin = atob(b64);
+      const len = bin.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+      try {
+        // fallback: decodeURIComponent(escape(atob())) — not perfect but may help
+        return decodeURIComponent(escape(atob(b64)));
+      } catch (_) {
+        return null;
+      }
+    }
   }
 
   async function downloadText(content, filename, mime = 'text/plain;charset=utf-8') {
@@ -303,15 +319,27 @@
                 const ct = resp.headers.get('content-type') || '';
                 if (ct.includes('application/json')) {
                   const j = await resp.json();
-                  if (typeof j === 'string') return j;
-                  for (const k of ['markdown', 'content', 'data', 'text']) {
-                    if (j && typeof j[k] === 'string') return j[k];
+                  if (typeof j === 'string') return { markdown: j };
+
+                  // 1) file_content_64 模式
+                  const fc64 = j?.file_content_64 || j?.data?.file_content_64;
+                  if (fc64 && typeof fc64 === 'string') {
+                    const md = base64ToUtf8(fc64);
+                    const filename = j?.filename || j?.data?.filename || null;
+                    if (md) return { markdown: md, filename };
                   }
-                  if (j && j.data && typeof j.data.markdown === 'string') return j.data.markdown;
-                  try { return JSON.stringify(j); } catch { return String(j); }
+
+                  // 2) 直接字符串字段
+                  for (const k of ['markdown', 'content', 'text']) {
+                    if (j && typeof j[k] === 'string') return { markdown: j[k] };
+                  }
+                  if (j && j.data && typeof j.data.markdown === 'string') return { markdown: j.data.markdown };
+
+                  // 3) 兜底：字符串化
+                  try { return { markdown: JSON.stringify(j) }; } catch { return { markdown: String(j) }; }
                 } else {
                   const t = await resp.text();
-                  return t;
+                  return { markdown: t };
                 }
               } catch (_) { /* 下一种 body 变体 */ }
             }
@@ -324,12 +352,15 @@
             const id = getThreadId(it);
             runBtn.textContent = `获取 Markdown ${i + 1}/${total}…`;
             try {
-              const md = await fetchThreadMarkdown(id);
+              const res = await fetchThreadMarkdown(id);
+              const md = res?.markdown || null;
+              const providedName = res?.filename ? safeFilename(res.filename) : null;
               if (withMdInput.checked) it.markdown = md;
 
-              const title = safeFilename(it.title || it.slug || id || `thread_${i + 1}`);
+              const title = providedName || safeFilename(it.title || it.slug || id || `thread_${i + 1}`);
               if (saveMdFilesInput.checked && md) {
-                await downloadText(md, `${title}.md`, 'text/markdown;charset=utf-8');
+                const filename = title.endsWith('.md') ? title : `${title}.md`;
+                await downloadText(md, filename, 'text/markdown;charset=utf-8');
               }
               if (mergeMdInput.checked && md) {
                 mergedMd += `# ${title}\n\n` + md + `\n\n---\n\n`;
@@ -386,4 +417,3 @@
 
   ready(createPanel);
 })();
-
