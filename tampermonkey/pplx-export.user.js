@@ -90,6 +90,48 @@
     return best;
   }
 
+  function parseRetryAfter(h) {
+    if (!h) return null;
+    // seconds or HTTP-date; we only handle seconds
+    const sec = parseInt(h, 10);
+    return Number.isFinite(sec) ? Math.max(0, sec) * 1000 : null;
+  }
+
+  async function fetchWithRetry(url, options = {}, cfg = {}) {
+    const {
+      retries = 5,
+      baseDelay = 800,
+      maxDelay = 15000,
+      autoBackoff = true
+    } = cfg;
+
+    let attempt = 0;
+    let lastErr;
+    while (attempt <= retries) {
+      try {
+        const resp = await fetch(url, options);
+        if (resp.status === 429) {
+          if (!autoBackoff) throw new Error('429 RATE_LIMITED');
+          const ra = parseRetryAfter(resp.headers.get('retry-after'));
+          const wait = ra != null ? ra : Math.min(maxDelay, baseDelay * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+          await sleep(wait);
+          attempt++;
+          continue;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        return resp;
+      } catch (e) {
+        lastErr = e;
+        if (attempt >= retries) break;
+        if (!autoBackoff) break;
+        const wait = Math.min(maxDelay, baseDelay * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+        await sleep(wait);
+        attempt++;
+      }
+    }
+    throw lastErr || new Error('fetchWithRetry failed');
+  }
+
   function downloadObjectAsJson(obj, filename) {
     const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -149,8 +191,7 @@
 
   async function fetchJson(url) {
     // 不设置任何额外认证请求头；沿用浏览器会话（Cookie 等由浏览器自动处理）
-    const resp = await fetch(url, { credentials: 'same-origin' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const resp = await fetchWithRetry(url, { credentials: 'same-origin' }, { retries: 4, baseDelay: 600, maxDelay: 8000, autoBackoff: true });
     return resp.json();
   }
 
@@ -200,6 +241,14 @@
       </div>
       <div class="pplx-export-row">
         <label style="display:flex;align-items:center;gap:6px;">
+          每条请求间隔(ms)：<input id="pplx-delay" type="number" min="0" max="60000" value="800" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;">
+          <input id="pplx-auto-backoff" type="checkbox" checked /> 429 自动退避
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">
           <input id="pplx-save-md-files" type="checkbox" /> 导出为多个 .md 文件
         </label>
         <label style="display:flex;align-items:center;gap:6px;">
@@ -225,6 +274,8 @@
     const slugInput = panel.querySelector('#pplx-slug');
     const limitInput = panel.querySelector('#pplx-limit');
     const withMdInput = panel.querySelector('#pplx-with-md');
+    const delayInput = panel.querySelector('#pplx-delay');
+    const autoBackoffInput = panel.querySelector('#pplx-auto-backoff');
     const saveMdFilesInput = panel.querySelector('#pplx-save-md-files');
     const mergeMdInput = panel.querySelector('#pplx-merge-md');
     const runBtn = panel.querySelector('#pplx-run');
@@ -283,7 +334,7 @@
         let enriched = items;
         if (withMdInput.checked || saveMdFilesInput.checked || mergeMdInput.checked) {
           const total = items.length;
-          const delayPer = 260; // ms
+          const delayPer = Math.max(0, parseInt(delayInput.value || '800', 10) || 0);
           const mdEndpoint = 'https://www.perplexity.ai/rest/thread/export';
 
           const getThreadId = (item) => {
@@ -309,13 +360,12 @@
 
             for (let i = 0; i < bodies.length; i++) {
               try {
-                const resp = await fetch(u.toString(), {
+                const resp = await fetchWithRetry(u.toString(), {
                   method: 'POST',
                   headers: { 'content-type': 'application/json' },
                   body: JSON.stringify(bodies[i]),
                   credentials: 'same-origin'
-                });
-                if (!resp.ok) continue;
+                }, { retries: 6, baseDelay: Math.max(600, delayPer || 600), maxDelay: 20000, autoBackoff: !!autoBackoffInput.checked });
                 const ct = resp.headers.get('content-type') || '';
                 if (ct.includes('application/json')) {
                   const j = await resp.json();
