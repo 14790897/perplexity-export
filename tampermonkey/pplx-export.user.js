@@ -491,7 +491,7 @@
                   {
                     retries: 6,
                     baseDelay: Math.max(600, delayPer || 600),
-                    maxDelay: 20000,
+                    maxDelay: 40000, // 最多 40 秒
                     autoBackoff: !!autoBackoffInput.checked,
                   }
                 );
