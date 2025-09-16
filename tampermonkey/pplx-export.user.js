@@ -1,12 +1,15 @@
 // ==UserScript==
 // @name         Perplexity 导出集合对话 (UTF-8)
 // @namespace    https://github.com/yourname/perplexity-export
-// @version      0.3.0
+// @version      0.5.0
 // @description  从 Perplexity 集合接口批量抓取列表并导出为 JSON；可选逐条获取 Markdown；可导出为多个/合并单个 .md；无需手动设置认证请求头。
-// @author       You
+// @author       liuweiqing
 // @match        https://www.perplexity.ai/*
 // @grant        GM_addStyle
 // @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @require      https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.7.53/dist/zip.min.js
 // @run-at       document-idle
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=perplexity.ai
 
@@ -66,6 +69,37 @@
 
   // ============ 工具函数 ============
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const store = {
+    get(key, defVal) {
+      try {
+        if (typeof GM_getValue === "function") return GM_getValue(key, defVal);
+        const v = localStorage.getItem(key);
+        return v == null ? defVal : JSON.parse(v);
+      } catch (_) {
+        return defVal;
+      }
+    },
+    set(key, val) {
+      try {
+        if (typeof GM_setValue === "function") return GM_setValue(key, val);
+        localStorage.setItem(key, JSON.stringify(val));
+      } catch (_) {}
+    },
+  };
+
+  // 从当前 URL 自动提取 collection_slug：优先 query，其次 /spaces/<slug> 或 /collections/<slug>
+  function extractCollectionSlugFromUrl(href) {
+    try {
+      const u = new URL(href);
+      const byQuery = u.searchParams.get('collection_slug');
+      if (byQuery) return byQuery;
+      const path = u.pathname || '';
+      const m = path.match(/\/(spaces|collections)\/([^\/?#]+)/i);
+      if (m && m[2]) return decodeURIComponent(m[2]);
+      return '';
+    } catch (_) { return ''; }
+  }
 
   function parseUrl(u) {
     try { return new URL(u); } catch { return null; }
@@ -189,28 +223,57 @@
     }
   }
 
+  async function downloadBlob(blob, filename) {
+    // 使用 a[download] 触发下载；部分管理器对 blob: URL 支持不佳，避免 GM_download 造成卡住
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // 延迟 revoke，确保浏览器已接手下载
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
   async function fetchJson(url) {
     // 不设置任何额外认证请求头；沿用浏览器会话（Cookie 等由浏览器自动处理）
-    const resp = await fetchWithRetry(url, { credentials: 'same-origin' }, { retries: 4, baseDelay: 600, maxDelay: 8000, autoBackoff: true });
+    const resp = await fetchWithRetry(
+      url,
+      { credentials: "same-origin" },
+      { retries: 4, baseDelay: 600, maxDelay: 8000, autoBackoff: true }
+    );
     return resp.json();
   }
 
-  async function paginateList(initialUrl, maxPages = 9999, delayMs = 220) {
+  async function paginateList(
+    initialUrl,
+    maxPages = 9999,
+    delayMs = 220,
+    maxTotal = Infinity
+  ) {
     let results = [];
     let page = 0;
     let url = new URL(initialUrl);
     const qp = url.searchParams;
-    let limit = parseInt(qp.get('limit') || '50', 10);
-    let offset = parseInt(qp.get('offset') || '0', 10);
+    let limit = parseInt(qp.get("limit") || "50", 10);
+    let offset = parseInt(qp.get("offset") || "0", 10);
 
     while (page < maxPages) {
-      const pageUrl = setUrlParam(setUrlParam(url.toString(), 'limit', limit), 'offset', offset);
+      const remaining = Math.max(0, maxTotal - results.length);
+      if (remaining <= 0) break;
+      const pageLimit = Math.max(1, Math.min(limit, remaining));
+      const pageUrl = setUrlParam(
+        setUrlParam(url.toString(), "limit", pageLimit),
+        "offset",
+        offset
+      );
       const data = await fetchJson(pageUrl);
       const arr = guessArrayPayload(data);
       if (!arr.length) break;
       results = results.concat(arr);
-      if (arr.length < limit) break;
-      offset += limit;
+      if (arr.length < pageLimit || results.length >= maxTotal) break;
+      offset += pageLimit;
       page += 1;
       if (delayMs) await sleep(delayMs);
     }
@@ -219,10 +282,10 @@
 
   // ============ UI ============
   function createPanel() {
-    if (document.getElementById('pplx-export-panel')) return;
-    const panel = document.createElement('div');
-    panel.id = 'pplx-export-panel';
-    panel.className = 'pplx-export-fab';
+    if (document.getElementById("pplx-export-panel")) return;
+    const panel = document.createElement("div");
+    panel.id = "pplx-export-panel";
+    panel.className = "pplx-export-fab";
     panel.innerHTML = `
       <div><strong>导出 PPLX 集合</strong></div>
       <div class="pplx-export-row">
@@ -270,87 +333,145 @@
 
     document.body.appendChild(panel);
 
-    const urlInput = panel.querySelector('#pplx-url');
-    const slugInput = panel.querySelector('#pplx-slug');
-    const limitInput = panel.querySelector('#pplx-limit');
-    const withMdInput = panel.querySelector('#pplx-with-md');
-    const delayInput = panel.querySelector('#pplx-delay');
-    const autoBackoffInput = panel.querySelector('#pplx-auto-backoff');
-    const saveMdFilesInput = panel.querySelector('#pplx-save-md-files');
-    const mergeMdInput = panel.querySelector('#pplx-merge-md');
-    const runBtn = panel.querySelector('#pplx-run');
+    const urlInput = panel.querySelector("#pplx-url");
+    const slugInput = panel.querySelector("#pplx-slug");
+    const limitInput = panel.querySelector("#pplx-limit");
+    const offsetInput = panel.querySelector("#pplx-offset");
+    const withMdInput = panel.querySelector("#pplx-with-md");
+    const delayInput = panel.querySelector("#pplx-delay");
+    const autoBackoffInput = panel.querySelector("#pplx-auto-backoff");
+    const saveMdFilesInput = panel.querySelector("#pplx-save-md-files");
+    const mergeMdInput = panel.querySelector("#pplx-merge-md");
+    const runBtn = panel.querySelector("#pplx-run");
 
     // 从当前页面猜测 slug（若 URL 中含有 collection_slug）
     try {
-      const here = new URL(location.href);
-      const guessSlug = here.searchParams.get('collection_slug') || '';
+      const guessSlug = extractCollectionSlugFromUrl(location.href);
       if (guessSlug) slugInput.value = guessSlug;
+    } catch (_) {}
+    // 恢复历史设置
+    try {
+      const savedMax = store.get('pplx_max_count', '');
+      if (maxCountInput && savedMax !== '' && savedMax != null) maxCountInput.value = String(savedMax);
+      const savedPart = store.get('pplx_part_size', 50);
+      if (partSizeInput && Number.isFinite(savedPart)) partSizeInput.value = String(savedPart);
+      const savedOffset = store.get('pplx_offset', 0);
+      if (offsetInput && Number.isFinite(savedOffset)) offsetInput.value = String(savedOffset);
+      const savedLimit = store.get('pplx_limit', 50);
+      if (limitInput && Number.isFinite(savedLimit)) limitInput.value = String(savedLimit);
+      const savedDelay = store.get('pplx_delay', 800);
+      if (delayInput && Number.isFinite(savedDelay)) delayInput.value = String(savedDelay);
     } catch (_) {}
 
     // 提供一个示例 URL，方便快速上手
     if (!urlInput.value) {
-      urlInput.placeholder = '例如: https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default';
+      urlInput.placeholder =
+        "例如: https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default";
     }
 
-    runBtn.addEventListener('click', async () => {
+    // 恢复“最大导出数”的记忆值
+    try {
+      const savedMax = store.get("pplx_max_count", "");
+      if (maxCountInput && savedMax !== "" && savedMax != null) {
+        maxCountInput.value = String(savedMax);
+      }
+    } catch (_) {}
+
+    if (maxCountInput) {
+      maxCountInput.addEventListener("change", () => {
+        const raw = parseInt(maxCountInput.value || "", 10);
+        store.set("pplx_max_count", Number.isFinite(raw) && raw > 0 ? raw : "");
+      });
+    }
+
+    runBtn.addEventListener("click", async () => {
       try {
         runBtn.disabled = true;
-        runBtn.textContent = '抓取中…';
+        runBtn.textContent = "抓取中…";
 
         let finalUrl = urlInput.value.trim();
         const slug = slugInput.value.trim();
-        const limit = Math.max(1, Math.min(200, parseInt(limitInput.value || '50', 10)));
+        const limit = Math.max(
+          1,
+          Math.min(200, parseInt(limitInput.value || "50", 10))
+        );
+        const offsetStart = Math.max(
+          0,
+          parseInt(offsetInput?.value || "0", 10) || 0
+        );
+        // 保存设置
+        try {
+          store.set('pplx_limit', limit);
+          store.set('pplx_offset', offsetStart);
+          const dly = Math.max(0, parseInt(delayInput.value || '800', 10) || 0);
+          store.set('pplx_delay', dly);
+        } catch (_) {}
 
         if (!finalUrl && slug) {
           // 自动拼接接口 URL
-          const base = 'https://www.perplexity.ai/rest/collections/list_collection_threads';
+          const base =
+            "https://www.perplexity.ai/rest/collections/list_collection_threads";
           const u = new URL(base);
-          u.searchParams.set('collection_slug', slug);
-          u.searchParams.set('limit', String(limit));
-          u.searchParams.set('filter_by_user', 'true');
-          u.searchParams.set('filter_by_shared_threads', 'false');
-          u.searchParams.set('offset', '0');
-          u.searchParams.set('version', '2.18');
-          u.searchParams.set('source', 'default');
+          u.searchParams.set("collection_slug", slug);
+          u.searchParams.set("limit", String(limit));
+          u.searchParams.set("filter_by_user", "true");
+          u.searchParams.set("filter_by_shared_threads", "false");
+          u.searchParams.set("offset", String(offsetStart));
+          u.searchParams.set("version", "2.18");
+          u.searchParams.set("source", "default");
           finalUrl = u.toString();
         }
 
         const valid = parseUrl(finalUrl);
         if (!valid) {
-          alert('请粘贴有效的接口 URL，或填写 collection_slug 以自动拼接 URL');
+          alert("请粘贴有效的接口 URL，或填写 collection_slug 以自动拼接 URL");
           return;
         }
 
         // 强制使用用户指定的 limit 与 offset 起点
-        finalUrl = setUrlParam(finalUrl, 'limit', limit);
-        finalUrl = setUrlParam(finalUrl, 'offset', 0);
+        finalUrl = setUrlParam(finalUrl, "limit", limit);
+        finalUrl = setUrlParam(finalUrl, "offset", offsetStart);
 
         const { items, lastOffset } = await paginateList(finalUrl, 9999, 220);
 
         const urlForParams = new URL(finalUrl);
-        const apiVersion = urlForParams.searchParams.get('version') || '2.18';
-        const apiSource = urlForParams.searchParams.get('source') || 'default';
+        const apiVersion = urlForParams.searchParams.get("version") || "2.18";
+        const apiSource = urlForParams.searchParams.get("source") || "default";
 
         let enriched = items;
-        if (withMdInput.checked || saveMdFilesInput.checked || mergeMdInput.checked) {
+        if (
+          withMdInput.checked ||
+          saveMdFilesInput.checked ||
+          mergeMdInput.checked
+        ) {
           const total = items.length;
-          const delayPer = Math.max(0, parseInt(delayInput.value || '800', 10) || 0);
-          const mdEndpoint = 'https://www.perplexity.ai/rest/thread/export';
+          const delayPer = Math.max(
+            0,
+            parseInt(delayInput.value || "800", 10) || 0
+          );
+          const mdEndpoint = "https://www.perplexity.ai/rest/thread/export";
 
           const getThreadId = (item) => {
-            const candidates = ['thread_id', 'threadId', 'id', 'uuid', 'thread_uuid'];
+            const candidates = [
+              "thread_id",
+              "threadId",
+              "id",
+              "uuid",
+              "thread_uuid",
+            ];
             for (const k of candidates) {
-              if (item && (k in item) && item[k]) return String(item[k]);
+              if (item && k in item && item[k]) return String(item[k]);
             }
-            if (item && item.thread && item.thread.id) return String(item.thread.id);
+            if (item && item.thread && item.thread.id)
+              return String(item.thread.id);
             return null;
           };
 
           const fetchThreadMarkdown = async (threadId) => {
             if (!threadId) return null;
             const u = new URL(mdEndpoint);
-            u.searchParams.set('version', apiVersion);
-            u.searchParams.set('source', apiSource);
+            u.searchParams.set("version", apiVersion);
+            u.searchParams.set("source", apiSource);
 
             const bodies = [
               // 首选：新接口要求的字段
@@ -359,43 +480,65 @@
 
             for (let i = 0; i < bodies.length; i++) {
               try {
-                const resp = await fetchWithRetry(u.toString(), {
-                  method: 'POST',
-                  headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify(bodies[i]),
-                  credentials: 'same-origin'
-                }, { retries: 6, baseDelay: Math.max(600, delayPer || 600), maxDelay: 20000, autoBackoff: !!autoBackoffInput.checked });
-                const ct = resp.headers.get('content-type') || '';
-                if (ct.includes('application/json')) {
+                const resp = await fetchWithRetry(
+                  u.toString(),
+                  {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(bodies[i]),
+                    credentials: "same-origin",
+                  },
+                  {
+                    retries: 6,
+                    baseDelay: Math.max(600, delayPer || 600),
+                    maxDelay: 20000,
+                    autoBackoff: !!autoBackoffInput.checked,
+                  }
+                );
+                const ct = resp.headers.get("content-type") || "";
+                if (ct.includes("application/json")) {
                   const j = await resp.json();
-                  if (typeof j === 'string') return { markdown: j };
+                  if (typeof j === "string") return { markdown: j };
 
                   // 1) file_content_64 模式
                   const fc64 = j?.file_content_64 || j?.data?.file_content_64;
-                  if (fc64 && typeof fc64 === 'string') {
+                  if (fc64 && typeof fc64 === "string") {
                     const md = base64ToUtf8(fc64);
                     const filename = j?.filename || j?.data?.filename || null;
                     if (md) return { markdown: md, filename };
                   }
 
                   // 2) 直接字符串字段
-                  for (const k of ['markdown', 'content', 'text']) {
-                    if (j && typeof j[k] === 'string') return { markdown: j[k] };
+                  for (const k of ["markdown", "content", "text"]) {
+                    if (j && typeof j[k] === "string")
+                      return { markdown: j[k] };
                   }
-                  if (j && j.data && typeof j.data.markdown === 'string') return { markdown: j.data.markdown };
+                  if (j && j.data && typeof j.data.markdown === "string")
+                    return { markdown: j.data.markdown };
 
                   // 3) 兜底：字符串化
-                  try { return { markdown: JSON.stringify(j) }; } catch { return { markdown: String(j) }; }
+                  try {
+                    return { markdown: JSON.stringify(j) };
+                  } catch {
+                    return { markdown: String(j) };
+                  }
                 } else {
                   const t = await resp.text();
                   return { markdown: t };
                 }
-              } catch (_) { /* 下一种 body 变体 */ }
+              } catch (_) {
+                /* 下一种 body 变体 */
+              }
             }
             return null;
           };
 
-          let mergedMd = '';
+          // merged markdown accumulator
+          let mergedMd = "";
+          // precompute slug for checkpoint filenames
+          const nameSlugForMd =
+            new URL(finalUrl).searchParams.get("collection_slug") ||
+            "collection";
           for (let i = 0; i < enriched.length; i++) {
             const it = enriched[i];
             const id = getThreadId(it);
@@ -403,26 +546,45 @@
             try {
               const res = await fetchThreadMarkdown(id);
               const md = res?.markdown || null;
-              const providedName = res?.filename ? safeFilename(res.filename) : null;
+              const providedName = res?.filename
+                ? safeFilename(res.filename)
+                : null;
               if (withMdInput.checked) it.markdown = md;
 
-              const title = providedName || safeFilename(it.title || it.slug || id || `thread_${i + 1}`);
+              const title =
+                providedName ||
+                safeFilename(it.title || it.slug || id || `thread_${i + 1}`);
               if (saveMdFilesInput.checked && md) {
-                const filename = title.endsWith('.md') ? title : `${title}.md`;
-                await downloadText(md, filename, 'text/markdown;charset=utf-8');
+                const filename = title.endsWith(".md") ? title : `${title}.md`;
+                await downloadText(md, filename, "text/markdown;charset=utf-8");
               }
               if (mergeMdInput.checked && md) {
                 mergedMd += `# ${title}\n\n` + md + `\n\n---\n\n`;
+                // 每下载 50 条，保存一次检查点，避免意外丢失进度
+                if ((i + 1) % 50 === 0) {
+                  try {
+                    await downloadText(
+                      mergedMd,
+                      `pplx_${nameSlugForMd}_merged_checkpoint_${i + 1}.md`,
+                      "text/markdown;charset=utf-8"
+                    );
+                  } catch (_) {
+                    // ignore checkpoint save errors and continue
+                  }
+                }
               }
             } catch (e) {
-              console.warn('[PPLX Export] markdown failed for', id, e);
+              console.warn("[PPLX Export] markdown failed for", id, e);
               it.markdown = null;
             }
             if (delayPer) await sleep(delayPer);
           }
           if (mergeMdInput.checked && mergedMd) {
-            const nameSlugForMd = (new URL(finalUrl)).searchParams.get('collection_slug') || 'collection';
-            await downloadText(mergedMd, `pplx_${nameSlugForMd}_merged.md`, 'text/markdown;charset=utf-8');
+            await downloadText(
+              mergedMd,
+              `pplx_${nameSlugForMd}_merged.md`,
+              "text/markdown;charset=utf-8"
+            );
           }
         }
 
@@ -437,32 +599,411 @@
             exportedMdFiles: !!saveMdFilesInput.checked,
             mergedMd: !!mergeMdInput.checked,
             version: apiVersion,
-            apiSource
+            apiSource,
           },
-          items: enriched
+          items: enriched,
         };
 
-        const nameSlug = (new URL(finalUrl)).searchParams.get('collection_slug') || 'collection';
-        const filename = `pplx_${nameSlug}_threads_${items.length}${withMdInput.checked ? '_with_md' : ''}.json`;
+        const nameSlug =
+          new URL(finalUrl).searchParams.get("collection_slug") || "collection";
+        const filename = `pplx_${nameSlug}_threads_${items.length}${
+          withMdInput.checked ? "_with_md" : ""
+        }.json`;
         downloadObjectAsJson(payload, filename);
 
-        runBtn.textContent = '完成，已下载 JSON';
+        runBtn.textContent = "完成，已下载 JSON";
       } catch (err) {
-        console.error('[PPLX Export] Error:', err);
-        alert('抓取失败：' + (err && err.message ? err.message : String(err)));
+        console.error("[PPLX Export] Error:", err);
+        alert("抓取失败：" + (err && err.message ? err.message : String(err)));
       } finally {
-        setTimeout(() => { runBtn.disabled = false; runBtn.textContent = '抓取并下载 JSON'; }, 1600);
+        setTimeout(() => {
+          runBtn.disabled = false;
+          runBtn.textContent = "抓取并下载 JSON";
+        }, 1600);
       }
     });
   }
 
   function ready(fn) {
-    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    if (
+      document.readyState === "complete" ||
+      document.readyState === "interactive"
+    ) {
       fn();
     } else {
-      document.addEventListener('DOMContentLoaded', fn, { once: true });
+      document.addEventListener("DOMContentLoaded", fn, { once: true });
     }
   }
 
-  ready(createPanel);
+  // 仅保留 ZIP 导出模式的新面板
+  function createPanelZipOnly() {
+    if (document.getElementById("pplx-export-panel")) return;
+    const panel = document.createElement("div");
+    panel.id = "pplx-export-panel";
+    panel.className = "pplx-export-fab";
+    panel.innerHTML = `
+      <div><strong>导出 Markdown ZIP</strong></div>
+      <div class="pplx-export-row">
+        <input id="pplx-url" type="text" placeholder="粘贴 list_collection_threads 接口完整 URL" />
+      </div>
+      <div class="pplx-export-row">
+        <input id="pplx-slug" type="text" placeholder="可选：collection_slug（留空则不自动拼 URL）" />
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">每页条数
+          <input id="pplx-limit" type="number" min="1" max="200" value="50" />
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">起始 offset
+          <input id="pplx-offset" type="number" min="0" step="1" value="0" />
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">最大导出数（留空为全部）
+          <input id="pplx-max-count" type="number" min="1" step="1" placeholder="全部" />
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">分卷大小（每卷条数）
+          <input id="pplx-part-size" type="number" min="1" max="100" value="50" />
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <label style="display:flex;align-items:center;gap:6px;">请求间隔(ms)
+          <input id="pplx-delay" type="number" min="0" max="60000" value="800" />
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
+          <input id="pplx-auto-backoff" type="checkbox" checked /> 429 自动退避
+        </label>
+      </div>
+      <div class="pplx-export-row">
+        <button id="pplx-run">导出 ZIP</button>
+      </div>
+      <div class="pplx-export-note">说明：仅导出为 ZIP（UTF-8）</div>`;
+
+    document.body.appendChild(panel);
+
+    const urlInput = panel.querySelector("#pplx-url");
+    const slugInput = panel.querySelector("#pplx-slug");
+    const limitInput = panel.querySelector("#pplx-limit");
+    const offsetInput = panel.querySelector("#pplx-offset");
+    const maxCountInput = panel.querySelector("#pplx-max-count");
+    const partSizeInput = panel.querySelector("#pplx-part-size");
+    const delayInput = panel.querySelector("#pplx-delay");
+    const autoBackoffInput = panel.querySelector("#pplx-auto-backoff");
+    const runBtn = panel.querySelector("#pplx-run");
+
+    try {
+      const guessSlug = extractCollectionSlugFromUrl(location.href);
+      if (guessSlug) slugInput.value = guessSlug;
+    } catch (_) {}
+    if (!urlInput.value) {
+      urlInput.placeholder =
+        "例如: https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default";
+    }
+
+    runBtn.addEventListener("click", async () => {
+      try {
+        runBtn.disabled = true;
+        runBtn.textContent = "抓取中…";
+
+        let finalUrl = urlInput.value.trim();
+        const slug = slugInput.value.trim();
+        const limit = Math.max(
+          1,
+          Math.min(200, parseInt(limitInput.value || "50", 10))
+        );
+        const offsetStart = Math.max(
+          0,
+          parseInt(offsetInput?.value || "0", 10) || 0
+        );
+        const partSizeRaw = parseInt(partSizeInput?.value || '50', 10);
+        const partSize = Math.max(1, Math.min(100, Number.isFinite(partSizeRaw) ? partSizeRaw : 50));
+        if (!finalUrl && slug) {
+          const base =
+            "https://www.perplexity.ai/rest/collections/list_collection_threads";
+          const u = new URL(base);
+          u.searchParams.set("collection_slug", slug);
+          u.searchParams.set("limit", String(limit));
+          u.searchParams.set("filter_by_user", "true");
+          u.searchParams.set("filter_by_shared_threads", "false");
+          u.searchParams.set("offset", String(offsetStart));
+          u.searchParams.set("version", "2.18");
+          u.searchParams.set("source", "default");
+          finalUrl = u.toString();
+        }
+        const valid = parseUrl(finalUrl);
+        if (!valid) {
+          alert("请粘贴有效的接口 URL，或填写 collection_slug 自动拼接 URL");
+          return;
+        }
+        finalUrl = setUrlParam(finalUrl, "limit", limit);
+        finalUrl = setUrlParam(finalUrl, "offset", offsetStart);
+
+        const maxCountRaw = parseInt(maxCountInput?.value || "", 10);
+        const maxCount =
+          Number.isFinite(maxCountRaw) && maxCountRaw > 0
+            ? maxCountRaw
+            : Infinity;
+        try {
+          store.set(
+            "pplx_max_count",
+            Number.isFinite(maxCountRaw) && maxCountRaw > 0 ? maxCountRaw : ""
+          );
+        } catch (_) {}
+        const { items } = await paginateList(finalUrl, 9999, 220, maxCount);
+
+        const urlForParams = new URL(finalUrl);
+        const apiVersion = urlForParams.searchParams.get("version") || "2.18";
+        const apiSource = urlForParams.searchParams.get("source") || "default";
+
+        if (!(window.zip && typeof zip.ZipWriter === 'function')) {
+          alert('zip.js 未加载，无法打包 ZIP。');
+          return;
+        }
+        let zipWriter = new zip.ZipWriter(new zip.BlobWriter('application/zip'));
+        const used = new Set();
+        const pad = (n, w) => String(n).padStart(w, "0");
+        const effectiveTotal = items.length;
+        const digits = String(offsetStart + effectiveTotal).length;
+        const mdEndpoint = "https://www.perplexity.ai/rest/thread/export";
+        const delayPer = Math.max(
+          0,
+          parseInt(delayInput.value || "800", 10) || 0
+        );
+
+        const getThreadId = (item) => {
+          const candidates = [
+            "thread_id",
+            "threadId",
+            "id",
+            "uuid",
+            "thread_uuid",
+          ];
+          for (const k of candidates) {
+            if (item && k in item && item[k]) return String(item[k]);
+          }
+          if (item && item.thread && item.thread.id)
+            return String(item.thread.id);
+          return null;
+        };
+
+        const fetchThreadMarkdown = async (threadId) => {
+          if (!threadId) return null;
+          const u = new URL(mdEndpoint);
+          u.searchParams.set("version", apiVersion);
+          u.searchParams.set("source", apiSource);
+          const bodies = [{ thread_uuid: threadId, format: "md" }];
+          for (let i = 0; i < bodies.length; i++) {
+            try {
+              const resp = await fetchWithRetry(
+                u.toString(),
+                {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify(bodies[i]),
+                  credentials: "same-origin",
+                },
+                {
+                  retries: 6,
+                  baseDelay: Math.max(600, delayPer || 600),
+                  maxDelay: 20000,
+                  autoBackoff: !!autoBackoffInput.checked,
+                }
+              );
+              const ct = resp.headers.get("content-type") || "";
+              if (ct.includes("application/json")) {
+                const j = await resp.json();
+                if (typeof j === "string") return { markdown: j };
+                const fc64 = j?.file_content_64 || j?.data?.file_content_64;
+                if (fc64 && typeof fc64 === "string") {
+                  const md = base64ToUtf8(fc64);
+                  const filename = j?.filename || j?.data?.filename || null;
+                  if (md) return { markdown: md, filename };
+                }
+                for (const k of ["markdown", "content", "text"]) {
+                  if (j && typeof j[k] === "string") return { markdown: j[k] };
+                }
+                if (j && j.data && typeof j.data.markdown === "string")
+                  return { markdown: j.data.markdown };
+                try {
+                  return { markdown: JSON.stringify(j) };
+                } catch {
+                  return { markdown: String(j) };
+                }
+              } else {
+                const t = await resp.text();
+                return { markdown: t };
+              }
+            } catch (_) {}
+          }
+          return null;
+        };
+
+        const nameSlug =
+          new URL(finalUrl).searchParams.get("collection_slug") || "collection";
+        const uniqueName = (base) => {
+          let n = base;
+          let idx = 2;
+          while (used.has(n)) n = `${base} (${idx++})`;
+          used.add(n);
+          return n;
+        };
+
+        let partIndex = 1;
+        let inPartCount = 0;
+
+        const flushPart = async () => {
+          if (inPartCount === 0) return;
+          runBtn.textContent = `正在打包 ZIP 分卷 ${partIndex}…`;
+          // 关闭当前 writer 获取 Blob 并下载，然后开启下一卷 writer
+          let blob;
+          try {
+            blob = await zipWriter.close();
+          } catch (e) {
+            console.error('[PPLX Export] ZIP 打包失败:', e);
+            throw e;
+          }
+          const partName = `pplx_${nameSlug}_markdown_part_${String(
+            partIndex
+          ).padStart(3, "0")}.zip`;
+          try {
+            console.log(
+              "[PPLX Export] downloading part",
+              partIndex,
+              "size=",
+              blob.size
+            );
+          } catch {}
+          // 自动触发 + 手动备用链接，避免浏览器阻止多文件下载导致无响应
+          const url = URL.createObjectURL(blob);
+          try {
+            const manual = document.createElement('a');
+            manual.href = url;
+            manual.download = partName;
+            manual.textContent = `点击保存分卷 ${partIndex}`;
+            manual.style.cssText = 'display:inline-block;margin-top:6px;color:#93c5fd;text-decoration:underline;';
+            const noteWrap = document.createElement('div');
+            noteWrap.style.marginTop = '6px';
+            noteWrap.appendChild(manual);
+            panel.appendChild(noteWrap);
+
+            // 尝试自动点击下载
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = partName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            // 60 秒后自动清理占用（若用户未手动点击）
+            setTimeout(() => { try { URL.revokeObjectURL(url); noteWrap.remove(); } catch {} }, 60000);
+            // 用户手动点击后立即清理
+            manual.addEventListener('click', () => {
+              setTimeout(() => { try { URL.revokeObjectURL(url); noteWrap.remove(); } catch {} }, 1500);
+            }, { once: true });
+          } catch (_) {
+            try { URL.revokeObjectURL(url); } catch {}
+          }
+          partIndex++;
+          inPartCount = 0;
+          zipWriter = new zip.ZipWriter(new zip.BlobWriter('application/zip'));
+        };
+
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          const id = getThreadId(it);
+          runBtn.textContent = `获取 Markdown ${i + 1}/${items.length}…`;
+          try {
+            const res = await fetchThreadMarkdown(id);
+            const md = res?.markdown || "";
+            const providedName = res?.filename
+              ? safeFilename(res.filename)
+              : null;
+            const title =
+              providedName ||
+              safeFilename(it.title || it.slug || id || `thread_${i + 1}`);
+            const fname = uniqueName(
+              `${pad(offsetStart + i + 1, digits)}_${title}.md`
+            );
+
+            if (items.length === 1) {
+              try {
+                const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const manual = document.createElement('a');
+                manual.href = url;
+                manual.download = fname;
+                manual.textContent = `点击保存 ${fname}`;
+                manual.style.cssText = 'display:inline-block;margin-top:6px;color:#93c5fd;text-decoration:underline;';
+                const noteWrap = document.createElement('div');
+                noteWrap.style.marginTop = '6px';
+                noteWrap.appendChild(manual);
+                panel.appendChild(noteWrap);
+
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fname;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => { try { URL.revokeObjectURL(url); noteWrap.remove(); } catch {} }, 60000);
+                manual.addEventListener('click', () => {
+                  setTimeout(() => { try { URL.revokeObjectURL(url); noteWrap.remove(); } catch {} }, 1500);
+                }, { once: true });
+                runBtn.textContent = '完成，已下载 .md';
+              } catch (e) {
+                console.error('[PPLX Export] 单条 .md 下载失败:', e);
+              }
+              return; // 单条直接结束，不进入 ZIP
+            }
+
+            // 将文件写入当前分卷（level=0 使用 STORE，无压缩更快更稳）
+            await zipWriter.add(
+              fname,
+              new zip.TextReader(md),
+              {
+                level: 0,
+                onprogress: (loaded, total) => {
+                  try {
+                    let percent = 0;
+                    if (typeof loaded === 'number' && typeof total === 'number' && total > 0) {
+                      percent = Math.floor((loaded / total) * 100);
+                    } else if (loaded && typeof loaded.loaded === 'number' && typeof loaded.total === 'number' && loaded.total > 0) {
+                      percent = Math.floor((loaded.loaded / loaded.total) * 100);
+                    }
+                    runBtn.textContent = `写入 ${fname} ${percent}%…`;
+                  } catch {}
+                }
+              }
+            );
+            inPartCount++;
+          } catch (e) {
+            console.warn("[PPLX Export] markdown failed for", id, e);
+          }
+          if (delayPer) await sleep(delayPer);
+
+          // 每 50 条导出一个分卷
+          if ((i + 1) % partSize === 0) {
+            await flushPart();
+          }
+        }
+
+        // 导出剩余未满分卷大小的分卷
+        await flushPart();
+        runBtn.textContent = "完成，已下载 ZIP 分卷";
+      } catch (err) {
+        console.error("[PPLX Export] Error:", err);
+        alert("抓取失败：" + (err && err.message ? err.message : String(err)));
+      } finally {
+        setTimeout(() => {
+          runBtn.disabled = false;
+          runBtn.textContent = "导出 ZIP";
+        }, 1600);
+      }
+    });
+  }
+
+  ready(createPanelZipOnly);
 })();
