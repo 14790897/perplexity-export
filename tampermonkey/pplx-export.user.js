@@ -2,6 +2,7 @@
 // @name         Perplexity 导出集合对话 (UTF-8)
 // @namespace    https://github.com/yourname/perplexity-export
 // @version      0.5.0
+// @charset      UTF-8
 // @description  从 Perplexity 集合接口批量抓取列表并导出为 JSON；可选逐条获取 Markdown；可导出为多个/合并单个 .md；无需手动设置认证请求头。
 // @author       liuweiqing
 // @match        https://www.perplexity.ai/*
@@ -82,8 +83,11 @@
     },
     set(key, val) {
       try {
-        if (typeof GM_setValue === "function") return GM_setValue(key, val);
-        localStorage.setItem(key, JSON.stringify(val));
+        // 双写，提升在不同注入/隔离模式下的可靠性
+        if (typeof GM_setValue === "function") {
+          try { GM_setValue(key, val); } catch (_) {}
+        }
+        try { localStorage.setItem(key, JSON.stringify(val)); } catch (_) {}
       } catch (_) {}
     },
   };
@@ -344,10 +348,15 @@
     const mergeMdInput = panel.querySelector("#pplx-merge-md");
     const runBtn = panel.querySelector("#pplx-run");
 
-    // 从当前页面猜测 slug（若 URL 中含有 collection_slug）
+    // 恢复已保存的 collection_slug；无保存时再尝试从当前页 URL 猜测
     try {
-      const guessSlug = extractCollectionSlugFromUrl(location.href);
-      if (guessSlug) slugInput.value = guessSlug;
+      const savedSlug = store.get('pplx_slug', '');
+      if (savedSlug) {
+        slugInput.value = savedSlug;
+      } else {
+        const guessSlug = extractCollectionSlugFromUrl(location.href);
+        if (guessSlug) slugInput.value = guessSlug;
+      }
     } catch (_) {}
     // 恢复历史设置
     try {
@@ -369,21 +378,6 @@
         "例如: https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default";
     }
 
-    // 恢复“最大导出数”的记忆值
-    try {
-      const savedMax = store.get("pplx_max_count", "");
-      if (maxCountInput && savedMax !== "" && savedMax != null) {
-        maxCountInput.value = String(savedMax);
-      }
-    } catch (_) {}
-
-    if (maxCountInput) {
-      maxCountInput.addEventListener("change", () => {
-        const raw = parseInt(maxCountInput.value || "", 10);
-        store.set("pplx_max_count", Number.isFinite(raw) && raw > 0 ? raw : "");
-      });
-    }
-
     runBtn.addEventListener("click", async () => {
       try {
         runBtn.disabled = true;
@@ -401,6 +395,7 @@
         );
         // 保存设置
         try {
+          store.set('pplx_slug', slug);
           store.set('pplx_limit', limit);
           store.set('pplx_offset', offsetStart);
           const dly = Math.max(0, parseInt(delayInput.value || '800', 10) || 0);
@@ -622,6 +617,25 @@
         }, 1600);
       }
     });
+
+    // 更稳的自动续跑：确保监听已绑定后再尝试点击，最多尝试 3 秒
+    try {
+      if (store.get('pplx_run_after_reload', false)) {
+        store.set('pplx_run_after_reload', false);
+        let tries = 0;
+        const timer = setInterval(() => {
+          tries++;
+          try {
+            if (!document.body.contains(runBtn)) { clearInterval(timer); return; }
+            if (runBtn.disabled) { clearInterval(timer); return; }
+            runBtn.click();
+          } catch (_) {}
+          if (runBtn.disabled || tries >= 15) {
+            clearInterval(timer);
+          }
+        }, 200);
+      }
+    } catch (_) {}
   }
 
   function ready(fn) {
@@ -694,14 +708,47 @@
     const autoBackoffInput = panel.querySelector("#pplx-auto-backoff");
     const runBtn = panel.querySelector("#pplx-run");
 
+    // 恢复历史设置，便于刷新后继续（ZIP 模式）
     try {
-      const guessSlug = extractCollectionSlugFromUrl(location.href);
-      if (guessSlug) slugInput.value = guessSlug;
+      const savedMax = store.get('pplx_max_count', '');
+      if (maxCountInput && savedMax !== '' && savedMax != null) maxCountInput.value = String(savedMax);
+      const savedPart = store.get('pplx_part_size', 50);
+      if (partSizeInput && Number.isFinite(savedPart)) partSizeInput.value = String(savedPart);
+      const savedOffset = store.get('pplx_offset', 0);
+      if (offsetInput && Number.isFinite(savedOffset)) offsetInput.value = String(savedOffset);
+      const savedLimit = store.get('pplx_limit', 50);
+      if (limitInput && Number.isFinite(savedLimit)) limitInput.value = String(savedLimit);
+      const savedDelay = store.get('pplx_delay', 800);
+      if (delayInput && Number.isFinite(savedDelay)) delayInput.value = String(savedDelay);
+      const savedSlug = store.get('pplx_slug', '');
+      if (savedSlug) slugInput.value = savedSlug;
+    } catch (_) {}
+
+    // 刷新后自动续跑（ZIP 模式）由文末“更稳的自动续跑（ZIP）”统一处理
+
+    // 记忆“最大导出数”的更改（ZIP 模式）
+    try {
+      if (maxCountInput) {
+        maxCountInput.addEventListener('change', () => {
+          const raw = parseInt(maxCountInput.value || '', 10);
+          store.set('pplx_max_count', Number.isFinite(raw) && raw > 0 ? raw : '');
+        });
+      }
+    } catch (_) {}
+
+    try {
+      if (!slugInput.value) {
+        const guessSlug = extractCollectionSlugFromUrl(location.href);
+        if (guessSlug) slugInput.value = guessSlug;
+      }
     } catch (_) {}
     if (!urlInput.value) {
       urlInput.placeholder =
         "例如: https://www.perplexity.ai/rest/collections/list_collection_threads?collection_slug=YOUR_SLUG&limit=50&filter_by_user=true&filter_by_shared_threads=false&offset=0&version=2.18&source=default";
     }
+
+    // slug 输入改变时即刻记忆
+    try { slugInput.addEventListener('change', () => { store.set('pplx_slug', slugInput.value.trim()); }); } catch (_) {}
 
     runBtn.addEventListener("click", async () => {
       try {
@@ -720,6 +767,16 @@
         );
         const partSizeRaw = parseInt(partSizeInput?.value || '50', 10);
         const partSize = Math.max(1, Math.min(100, Number.isFinite(partSizeRaw) ? partSizeRaw : 50));
+        const refreshEvery = 10; // 每导出 10 条自动刷新页面
+        // 保存当前设置，刷新后可恢复
+        try {
+          store.set('pplx_slug', slug);
+          const dly = Math.max(0, parseInt(delayInput.value || '800', 10) || 0);
+          store.set('pplx_delay', dly);
+          store.set('pplx_limit', limit);
+          store.set('pplx_offset', offsetStart);
+          store.set('pplx_part_size', partSize);
+        } catch (_) {}
         if (!finalUrl && slug) {
           const base =
             "https://www.perplexity.ai/rest/collections/list_collection_threads";
@@ -751,6 +808,7 @@
             "pplx_max_count",
             Number.isFinite(maxCountRaw) && maxCountRaw > 0 ? maxCountRaw : ""
           );
+          store.set('pplx_part_size', partSize);
         } catch (_) {}
         const { items } = await paginateList(finalUrl, 9999, 220, maxCount);
 
@@ -979,6 +1037,25 @@
               }
             );
             inPartCount++;
+
+            // 每导出 N 条，保存进度并刷新页面以续跑
+            if (((i + 1) % refreshEvery === 0) && (i + 1) < items.length) {
+              try {
+                // 刷新前尽量落盘当前分卷
+                await flushPart();
+              } catch (_) {}
+              try {
+                const nextOffset = offsetStart + i + 1;
+                store.set('pplx_offset', nextOffset);
+                store.set('pplx_run_after_reload', true);
+                store.set('pplx_part_size', partSize);
+                // 轻微延迟，给下载触发时间
+                setTimeout(() => { location.reload(); }, 500);
+                return; // 结束当前任务，等待刷新后续跑
+              } catch (_) {
+                // 如果存储失败则不中断流程
+              }
+            }
           } catch (e) {
             console.warn("[PPLX Export] markdown failed for", id, e);
           }
@@ -1003,6 +1080,25 @@
         }, 1600);
       }
     });
+
+    // 更稳的自动续跑（ZIP）：监听已绑定后再尝试点击，最多尝试 3 秒
+    try {
+      if (store.get('pplx_run_after_reload', false)) {
+        store.set('pplx_run_after_reload', false);
+        let tries = 0;
+        const timer = setInterval(() => {
+          tries++;
+          try {
+            if (!document.body.contains(runBtn)) { clearInterval(timer); return; }
+            if (runBtn.disabled) { clearInterval(timer); return; }
+            runBtn.click();
+          } catch (_) {}
+          if (runBtn.disabled || tries >= 15) {
+            clearInterval(timer);
+          }
+        }, 200);
+      }
+    } catch (_) {}
   }
 
   ready(createPanelZipOnly);
